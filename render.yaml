@@ -1,0 +1,151 @@
+# =============================================================================
+# AgroConnect 2.0 — render.yaml
+# Infraestructura como Código (IaC) para Render.com
+# =============================================================================
+# Ubica este archivo en la RAÍZ del monorepo: agroconnect/render.yaml
+#
+# Orquesta dos servicios web independientes:
+#   1. backend_api   → Node.js / Express / Prisma  (puerto 10000)
+#   2. agrobot_ai    → Python / FastAPI / Anthropic (puerto 10000)
+#
+# Render asigna automáticamente el puerto 10000 a todos los web services.
+# Las URLs internas entre servicios del mismo Render account usan el
+# nombre de servicio como hostname dentro de la red privada de Render.
+#
+# IMPORTANTE: Las variables marcadas con `sync: false` NUNCA se escriben
+# en este archivo — debes configurarlas manualmente en el panel de Render
+# Dashboard > Environment para cada servicio (ver guia_despliegue_nube.txt).
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # SERVICIO 1: Backend API — Node.js + Express + Prisma + PostgreSQL (Neon)
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: agroconnect-backend
+    runtime: node
+    region: oregon                        # Región más cercana a LATAM con menor latencia
+    plan: starter                         # Upgrade a "standard" en producción real
+    rootDir: backend                      # Carpeta raíz del servicio Express
+    buildCommand: npm ci && npx prisma generate
+    startCommand: npx prisma db push --accept-data-loss && node src/server.js
+
+    # Política de auto-deploy: cada push a la rama main despliega automáticamente
+    autoDeploy: true
+    branch: main
+
+    # Health check: Render verifica que el servicio esté vivo en este endpoint
+    healthCheckPath: /api/health
+
+    # Variables de entorno — las que contienen secrets usan sync:false
+    envVars:
+      # ── Entorno de ejecución ──────────────────────────────────────────────
+      - key: NODE_ENV
+        value: production
+
+      - key: PORT
+        value: "10000"
+
+      # ── Base de datos Neon PostgreSQL ─────────────────────────────────────
+      # ⚠️  CONFIGURA MANUALMENTE en Render Dashboard > agroconnect-backend > Environment
+      - key: DATABASE_URL
+        sync: false                       # Secret: nunca se commitea al repo
+
+      # ── JWT ───────────────────────────────────────────────────────────────
+      # ⚠️  CONFIGURA MANUALMENTE — usa un secret de al menos 64 caracteres aleatorios
+      - key: JWT_SECRET
+        sync: false
+
+      - key: JWT_EXPIRES_IN
+        value: "1h"
+
+      - key: JWT_REFRESH_EXPIRES_IN
+        value: "30d"
+
+      # ── Referencia interna al microservicio de IA (red privada de Render) ──
+      # Render genera automáticamente URLs internas con el patrón:
+      # https://<service-name>.onrender.com  (externa)
+      # http://<service-name>:10000          (interna — más rápida, sin TLS overhead)
+      # Usamos la URL interna para comunicación backend ↔ agrobot
+      - key: AI_SERVICE_URL
+        value: http://agroconnect-agrobot:10000
+
+      # ── URL del frontend (Vercel) para validación CORS ───────────────────
+      # ⚠️  CONFIGURA MANUALMENTE con tu URL real de Vercel tras el primer deploy
+      # Ejemplo: https://agroconnect.vercel.app
+      - key: FRONTEND_URL
+        sync: false
+
+      # ── Configuración de logs ─────────────────────────────────────────────
+      - key: LOG_LEVEL
+        value: info
+
+      # ── Rate limiting ─────────────────────────────────────────────────────
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "60000"
+
+      - key: RATE_LIMIT_MAX_REQUESTS
+        value: "100"
+
+      # ── Timeout al llamar al microservicio de IA ──────────────────────────
+      - key: AI_REQUEST_TIMEOUT_MS
+        value: "30000"
+
+  # ---------------------------------------------------------------------------
+  # SERVICIO 2: AgroBot AI — Python + FastAPI + Anthropic SDK
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: agroconnect-agrobot
+    runtime: python
+    region: oregon                        # DEBE coincidir con la región del backend
+    plan: starter
+    rootDir: services/agrobot-service
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000 --workers 2
+
+    autoDeploy: true
+    branch: main
+
+    # FastAPI expone /health por convención — añade este endpoint si no existe
+    healthCheckPath: /health
+
+    envVars:
+      # ── Entorno de ejecución ──────────────────────────────────────────────
+      - key: PYTHON_ENV
+        value: production
+
+      # ── LLM — Anthropic ───────────────────────────────────────────────────
+      # ⚠️  CONFIGURA MANUALMENTE en Render Dashboard > agroconnect-agrobot > Environment
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+      - key: LLM_MODEL
+        value: claude-sonnet-4-5
+
+      - key: LLM_TEMPERATURE
+        value: "0.3"
+
+      - key: LLM_MAX_TOKENS
+        value: "1024"
+
+      # ── Referencia interna al backend Express ────────────────────────────
+      # AgroBot llama al backend para cargar perfil e historial del usuario
+      - key: BACKEND_URL
+        value: http://agroconnect-backend:10000
+
+      # ── CORS: lista de orígenes permitidos para FastAPI ───────────────────
+      # Incluye la URL interna de Render + tu dominio de Vercel
+      # ⚠️  ACTUALIZA con tu URL real de Vercel tras el primer deploy
+      - key: CORS_ORIGINS
+        sync: false                       # Valor: http://agroconnect-backend:10000,https://agroconnect.vercel.app
+
+      # ── Timeout HTTP hacia el backend ─────────────────────────────────────
+      - key: HTTP_TIMEOUT_S
+        value: "5.0"
+
+      # ── Workers de Uvicorn ────────────────────────────────────────────────
+      # Para plan starter 1-2 workers es adecuado
+      # Incrementar en planes superiores: floor(2 * CPU_cores + 1)
+      - key: UVICORN_WORKERS
+        value: "2"
